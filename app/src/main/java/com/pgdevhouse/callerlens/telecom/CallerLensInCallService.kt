@@ -17,7 +17,10 @@ import com.pgdevhouse.callerlens.CallActivity
 import com.pgdevhouse.callerlens.R
 import com.pgdevhouse.callerlens.data.CallLogRepository
 import com.pgdevhouse.callerlens.data.NumberStats
+import com.pgdevhouse.callerlens.data.fallbackCallerName
 import com.pgdevhouse.callerlens.data.formatPhoneNumber
+import com.pgdevhouse.callerlens.data.isUsablePhoneNumber
+import com.pgdevhouse.callerlens.data.normalizedPhoneKey
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -139,16 +142,21 @@ class CallerLensInCallService : InCallService() {
 
         val details = call.details
         val number = details.handle?.schemeSpecificPart.orEmpty()
+        val presentation = details.handlePresentation
+        val usableNumber = isUsablePhoneNumber(number, presentation)
+        val numberKey = if (usableNumber) normalizedPhoneKey(number) else null
         val name = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             details.contactDisplayName?.takeIf { it.isNotBlank() }
         } else null
-        val display = name ?: details.callerDisplayName?.takeIf { it.isNotBlank() } ?: formatPhoneNumber(number)
+        val display = name
+            ?: details.callerDisplayName?.takeIf { it.isNotBlank() }
+            ?: if (usableNumber) formatPhoneNumber(number) else fallbackCallerName(presentation)
         val isIncoming = details.callDirection == Call.Details.DIRECTION_INCOMING
         val isRinging = state == Call.STATE_RINGING || state == Call.STATE_SIMULATED_RINGING
-        val stats = if (number.isNotBlank()) statsCache[number] else null
+        val stats = numberKey?.let(statsCache::get)
 
-        if (isIncoming && isRinging && number.isNotBlank() && stats == null) {
-            loadRecentStats(call, number)
+        if (isIncoming && isRinging && numberKey != null && stats == null) {
+            loadRecentStats(call, number, numberKey)
         }
 
         val fullScreenIntent = Intent(this, CallActivity::class.java).apply {
@@ -167,30 +175,28 @@ class CallerLensInCallService : InCallService() {
 
         val frequencyHeadline = if (isIncoming && isRinging && stats != null) {
             val liveCount = stats.total + 1
-            "$liveCount ${if (liveCount == 1) "call" else "calls"} / 7 days"
+            "$liveCount ${if (liveCount == 1) "call" else "calls"} in the last 7 days"
         } else null
 
-        // Put the frequency in the caller line as well as the body. CallStyle may
-        // compress the notification on some devices, so this keeps CallerLens's
-        // core information visible even in a small heads-up notification.
-        val notificationCaller = if (frequencyHeadline != null) {
-            "$display · $frequencyHeadline"
-        } else {
-            display
-        }
-
+        // Keep the caller identity on line 1 by itself. The frequency starts on
+        // line 2 so it does not get clipped beside a long caller name/number.
+        // The history detail is requested on line 3; compact OEM heads-up layouts
+        // may hide that third line, but the frequency line remains visible.
         val notificationBody = when {
+            isIncoming && isRinging && !usableNumber -> "Recent call history unavailable"
             isIncoming && isRinging && stats == null -> "Checking recent call history…"
-            isIncoming && isRinging && stats != null -> buildRecentHistoryText(stats)
+            isIncoming && isRinging && stats != null ->
+                "$frequencyHeadline\n${buildRecentHistoryText(stats)}"
             state == Call.STATE_ACTIVE -> "Call in progress"
             state == Call.STATE_HOLDING -> "Call on hold"
-            else -> formatPhoneNumber(number)
+            usableNumber -> formatPhoneNumber(number)
+            else -> fallbackCallerName(presentation)
         }
 
-        val person = Person.Builder().setName(notificationCaller).build()
+        val person = Person.Builder().setName(display).build()
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_caller_lens)
-            .setContentTitle(notificationCaller)
+            .setContentTitle(display)
             .setContentText(notificationBody)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setPriority(NotificationCompat.PRIORITY_MAX)
@@ -198,7 +204,7 @@ class CallerLensInCallService : InCallService() {
             .setContentIntent(fullScreenPendingIntent)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
 
-        if (name != null && number.isNotBlank()) {
+        if (name != null && usableNumber) {
             builder.setSubText(formatPhoneNumber(number))
         }
 
@@ -233,16 +239,16 @@ class CallerLensInCallService : InCallService() {
         startNotificationWatchdog()
     }
 
-    private fun loadRecentStats(call: Call, number: String) {
-        if (!statsLoadsInFlight.add(number)) return
+    private fun loadRecentStats(call: Call, number: String, numberKey: String) {
+        if (!statsLoadsInFlight.add(numberKey)) return
 
         serviceScope.launch {
             val stats = runCatching {
                 CallLogRepository(this@CallerLensInCallService).statsFor(number, RECENT_HISTORY_DAYS)
             }.getOrDefault(NumberStats(days = RECENT_HISTORY_DAYS))
 
-            statsLoadsInFlight.remove(number)
-            statsCache[number] = stats
+            statsLoadsInFlight.remove(numberKey)
+            statsCache[numberKey] = stats
 
             val stillLive = notificationCallbacks.containsKey(call) &&
                 runCatching { currentState(call) != Call.STATE_DISCONNECTED }.getOrDefault(false)
@@ -258,6 +264,7 @@ class CallerLensInCallService : InCallService() {
             if (stats.missed > 0) add("${stats.missed} missed")
             if (stats.rejected > 0) add("${stats.rejected} rejected")
             if (stats.answered > 0) add("${stats.answered} answered")
+            if (stats.blocked > 0) add("${stats.blocked} blocked")
         }.joinToString(" · ")
 
         return if (breakdown.isBlank()) last else "$last · $breakdown"

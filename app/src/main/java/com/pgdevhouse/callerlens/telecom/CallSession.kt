@@ -6,9 +6,11 @@ import android.os.Build
 import android.provider.BlockedNumberContract
 import android.telecom.Call
 import android.telecom.CallAudioState
+import android.telecom.TelecomManager
 import android.telecom.VideoProfile
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import com.pgdevhouse.callerlens.data.isUsablePhoneNumber
 import kotlinx.coroutines.flow.asStateFlow
 
 
@@ -16,6 +18,7 @@ data class CallUiState(
     val hasCall: Boolean = false,
     val number: String = "",
     val displayName: String? = null,
+    val numberPresentation: Int = TelecomManager.PRESENTATION_UNKNOWN,
     val state: Int = Call.STATE_DISCONNECTED,
     val isIncoming: Boolean = true,
     val isMuted: Boolean = false,
@@ -115,15 +118,18 @@ object CallSession {
     }
 
     fun blockNumber(context: Context): Boolean {
-        val number = _uiState.value.number
-        if (number.isBlank()) return false
+        val current = _uiState.value
+        val number = current.number
+        if (!isUsablePhoneNumber(number, current.numberPresentation)) return false
         if (!BlockedNumberContract.canCurrentUserBlockNumbers(context)) return false
 
         return try {
-            val values = ContentValues().apply {
-                put(BlockedNumberContract.BlockedNumbers.COLUMN_ORIGINAL_NUMBER, number)
+            if (!BlockedNumberContract.isBlocked(context, number)) {
+                val values = ContentValues().apply {
+                    put(BlockedNumberContract.BlockedNumbers.COLUMN_ORIGINAL_NUMBER, number)
+                }
+                context.contentResolver.insert(BlockedNumberContract.BlockedNumbers.CONTENT_URI, values)
             }
-            context.contentResolver.insert(BlockedNumberContract.BlockedNumbers.CONTENT_URI, values)
             rejectAsUnwanted()
             true
         } catch (_: SecurityException) {
@@ -163,6 +169,7 @@ object CallSession {
         val number = details.handle?.schemeSpecificPart.orEmpty()
         val contactName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) details.contactDisplayName else null
         val networkName = details.callerDisplayName
+        val presentation = details.handlePresentation
         val direction = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) details.callDirection else Call.Details.DIRECTION_UNKNOWN
 
         _uiState.value = _uiState.value.copy(
@@ -170,6 +177,7 @@ object CallSession {
             number = number,
             displayName = contactName?.takeIf { it.isNotBlank() }
                 ?: networkName?.takeIf { it.isNotBlank() },
+            numberPresentation = presentation,
             state = state,
             isIncoming = direction != Call.Details.DIRECTION_OUTGOING
         )

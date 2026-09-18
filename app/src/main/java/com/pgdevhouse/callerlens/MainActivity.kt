@@ -15,9 +15,9 @@ import android.provider.CallLog
 import android.provider.ContactsContract
 import android.provider.Settings
 import android.telecom.TelecomManager
-import android.telephony.PhoneNumberUtils
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -40,11 +40,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Backspace
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Settings
@@ -69,6 +71,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -84,12 +87,20 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.pgdevhouse.callerlens.data.BlockedNumberItem
+import com.pgdevhouse.callerlens.data.BlockedNumberRepository
 import com.pgdevhouse.callerlens.data.CallLogRepository
 import com.pgdevhouse.callerlens.data.NumberStats
 import com.pgdevhouse.callerlens.data.RecentCaller
 import com.pgdevhouse.callerlens.data.formatLastCall
 import com.pgdevhouse.callerlens.data.formatPhoneNumber
+import com.pgdevhouse.callerlens.data.isUsablePhoneNumber
+import com.pgdevhouse.callerlens.data.normalizedPhoneKey
 import com.pgdevhouse.callerlens.ui.theme.CallerLensTheme
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val RECENT_PREFS = "caller_lens_recent_callers"
@@ -114,7 +125,9 @@ class MainActivity : ComponentActivity() {
 private fun MainActivity.CallerLensHome(initialNumber: String) {
     val context = this
     val repository = remember(context) { CallLogRepository(context) }
+    val blockedRepository = remember(context) { BlockedNumberRepository(context) }
     val scope = rememberCoroutineScope()
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     var defaultDialer by remember { mutableStateOf(holdsDialerRole(context)) }
     var permissionsGranted by remember { mutableStateOf(requiredPermissions().all { hasPermission(context, it) }) }
@@ -123,6 +136,9 @@ private fun MainActivity.CallerLensHome(initialNumber: String) {
     var fullScreenAllowed by remember { mutableStateOf(canUseFullScreenCalls(context)) }
     var detailCaller by remember { mutableStateOf<RecentCaller?>(null) }
     var detailStats by remember { mutableStateOf<NumberStats?>(null) }
+    var showBlockedNumbers by remember { mutableStateOf(false) }
+    var blockedNumbers by remember { mutableStateOf<List<BlockedNumberItem>>(emptyList()) }
+    var blockedNumbersLoading by remember { mutableStateOf(false) }
     var keepScreenOnDuringCall by remember {
         mutableStateOf(
             context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
@@ -142,10 +158,69 @@ private fun MainActivity.CallerLensHome(initialNumber: String) {
         fullScreenAllowed = canUseFullScreenCalls(context)
     }
 
-    LaunchedEffect(permissionsGranted) {
+    LaunchedEffect(permissionsGranted, defaultDialer) {
         if (permissionsGranted) {
             recentCallers = repository.recentCallers().filterNot { isCallerHidden(context, it) }
         }
+        if (BlockedNumberContract.canCurrentUserBlockNumbers(context)) {
+            blockedNumbersLoading = true
+            blockedNumbers = blockedRepository.blockedNumbers()
+            blockedNumbersLoading = false
+        } else {
+            blockedNumbers = emptyList()
+        }
+    }
+
+    // A call can finish while MainActivity is sitting behind CallActivity. Refresh on
+    // every resume, then once more shortly afterward because some phone apps/providers
+    // write the final call-log row a fraction of a second after Telecom disconnects.
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val nowPermissionsGranted = requiredPermissions().all { hasPermission(context, it) }
+                permissionsGranted = nowPermissionsGranted
+                defaultDialer = holdsDialerRole(context)
+                fullScreenAllowed = canUseFullScreenCalls(context)
+
+                scope.launch {
+                    if (nowPermissionsGranted) {
+                        recentCallers = repository.recentCallers().filterNot { isCallerHidden(context, it) }
+                        delay(700)
+                        recentCallers = repository.recentCallers().filterNot { isCallerHidden(context, it) }
+                    }
+                    blockedNumbers = if (BlockedNumberContract.canCurrentUserBlockNumbers(context)) {
+                        blockedRepository.blockedNumbers()
+                    } else {
+                        emptyList()
+                    }
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    BackHandler(enabled = showBlockedNumbers) { showBlockedNumbers = false }
+
+    if (showBlockedNumbers) {
+        BlockedNumbersScreen(
+            blockedNumbers = blockedNumbers,
+            loading = blockedNumbersLoading,
+            canManage = BlockedNumberContract.canCurrentUserBlockNumbers(context),
+            onBack = { showBlockedNumbers = false },
+            onUnblock = { item ->
+                scope.launch {
+                    val unblocked = blockedRepository.unblock(item)
+                    if (unblocked) {
+                        blockedNumbers = blockedRepository.blockedNumbers()
+                        Toast.makeText(context, "Number unblocked.", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(context, "CallerLens could not unblock this number.", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        )
+        return
     }
 
     detailCaller?.let { caller ->
@@ -247,6 +322,18 @@ private fun MainActivity.CallerLensHome(initialNumber: String) {
                             .apply()
                     }
                 )
+                Spacer(Modifier.height(10.dp))
+                BlockedNumbersEntryCard(
+                    count = blockedNumbers.size,
+                    onClick = {
+                        showBlockedNumbers = true
+                        blockedNumbersLoading = true
+                        scope.launch {
+                            blockedNumbers = blockedRepository.blockedNumbers()
+                            blockedNumbersLoading = false
+                        }
+                    }
+                )
             }
 
             item {
@@ -302,7 +389,11 @@ private fun MainActivity.CallerLensHome(initialNumber: String) {
                             }
                         },
                         onAddToContacts = { addToContacts(context, caller) },
-                        onBlock = { blockNumber(context, caller.number) },
+                        onBlock = {
+                            if (blockNumber(context, caller.number)) {
+                                scope.launch { blockedNumbers = blockedRepository.blockedNumbers() }
+                            }
+                        },
                         onRemove = {
                             hideCallerUntilNextCall(context, caller)
                             recentCallers = recentCallers.filterNot {
@@ -452,6 +543,186 @@ private fun PreferenceCard(
                     uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
                 )
             )
+        }
+    }
+}
+
+@Composable
+private fun BlockedNumbersEntryCard(
+    count: Int,
+    onClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(22.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 18.dp, vertical = 15.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Surface(
+                modifier = Modifier.size(42.dp),
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                contentColor = MaterialTheme.colorScheme.onSurfaceVariant
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.Block, contentDescription = null)
+                }
+            }
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Blocked numbers", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    if (count == 1) "1 number currently blocked" else "$count numbers currently blocked",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                )
+            }
+
+            OutlinedButton(
+                onClick = onClick,
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.background.copy(alpha = 0.45f))
+            ) {
+                Text("Manage")
+            }
+        }
+    }
+}
+
+@Composable
+private fun BlockedNumbersScreen(
+    blockedNumbers: List<BlockedNumberItem>,
+    loading: Boolean,
+    canManage: Boolean,
+    onBack: () -> Unit,
+    onUnblock: (BlockedNumberItem) -> Unit
+) {
+    Scaffold(containerColor = MaterialTheme.colorScheme.background) { padding ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                start = 18.dp,
+                end = 18.dp,
+                top = 18.dp,
+                bottom = 30.dp
+            ),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Surface(
+                        modifier = Modifier.size(46.dp),
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary
+                    ) {
+                        IconButton(onClick = onBack) {
+                            Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        }
+                    }
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "Blocked numbers",
+                            style = MaterialTheme.typography.headlineMedium,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                        Text(
+                            "Numbers blocked through Android's phone system",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.74f)
+                        )
+                    }
+                }
+            }
+
+            when {
+                !canManage -> item {
+                    EmptyStateCard(
+                        title = "Blocked list unavailable",
+                        body = "CallerLens must be the default Phone app to manage Android's blocked numbers."
+                    )
+                }
+                loading -> item {
+                    EmptyStateCard(
+                        title = "Loading blocked numbers…",
+                        body = "CallerLens is checking Android's blocked-number list."
+                    )
+                }
+                blockedNumbers.isEmpty() -> item {
+                    EmptyStateCard(
+                        title = "No blocked numbers",
+                        body = "Numbers you block in CallerLens will appear here so you can unblock them later."
+                    )
+                }
+                else -> items(blockedNumbers, key = { it.id }) { item ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surface,
+                            contentColor = MaterialTheme.colorScheme.onSurface
+                        ),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Surface(
+                                modifier = Modifier.size(44.dp),
+                                shape = CircleShape,
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                contentColor = MaterialTheme.colorScheme.onSurfaceVariant
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(Icons.Default.Block, contentDescription = null)
+                                }
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    formatPhoneNumber(item.number),
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                                Text(
+                                    "Blocked",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
+                                )
+                            }
+                            Button(
+                                onClick = { onUnblock(item) },
+                                shape = RoundedCornerShape(14.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.primary,
+                                    contentColor = MaterialTheme.colorScheme.onPrimary
+                                )
+                            ) {
+                                Icon(Icons.Default.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Text("  Unblock")
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -655,6 +926,7 @@ private fun RecentCallerCard(
     if (menuOpen) {
         CallerActionsDialog(
             caller = caller,
+            canManageNumber = isUsablePhoneNumber(caller.number),
             onDismiss = { menuOpen = false },
             onDetails = {
                 menuOpen = false
@@ -817,6 +1089,7 @@ private fun SmallPill(text: String) {
 @Composable
 private fun CallerActionsDialog(
     caller: RecentCaller,
+    canManageNumber: Boolean,
     onDismiss: () -> Unit,
     onDetails: () -> Unit,
     onCall: () -> Unit,
@@ -852,9 +1125,11 @@ private fun CallerActionsDialog(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 PopupAction(Icons.Default.Info, "Details", onDetails)
-                PopupAction(Icons.Default.Call, "Call back", onCall)
-                PopupAction(Icons.Default.PersonAdd, "Add to contacts", onAddToContacts)
-                PopupAction(Icons.Default.Block, "Block number", onBlock)
+                if (canManageNumber) {
+                    PopupAction(Icons.Default.Call, "Call back", onCall)
+                    PopupAction(Icons.Default.PersonAdd, "Add to contacts", onAddToContacts)
+                    PopupAction(Icons.Default.Block, "Block number", onBlock)
+                }
                 PopupAction(Icons.Default.DeleteOutline, "Remove from recent callers", onRemove)
             }
         },
@@ -935,7 +1210,7 @@ private fun CallerDetailsDialog(
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Text(
-                                "${stats.total + stats.blocked} calls in the last ${stats.days} days",
+                                "${stats.total} calls in the last ${stats.days} days",
                                 style = MaterialTheme.typography.titleMedium
                             )
                             Text(
@@ -1018,6 +1293,11 @@ private fun placeCall(context: Context, number: String) {
 }
 
 private fun addToContacts(context: Context, caller: RecentCaller) {
+    if (!isUsablePhoneNumber(caller.number)) {
+        Toast.makeText(context, "This caller did not provide a usable phone number.", Toast.LENGTH_SHORT).show()
+        return
+    }
+
     val intent = Intent(Intent.ACTION_INSERT).apply {
         type = ContactsContract.Contacts.CONTENT_TYPE
         putExtra(ContactsContract.Intents.Insert.PHONE, caller.number)
@@ -1033,24 +1313,35 @@ private fun addToContacts(context: Context, caller: RecentCaller) {
     }
 }
 
-private fun blockNumber(context: Context, number: String) {
+private fun blockNumber(context: Context, number: String): Boolean {
+    if (!isUsablePhoneNumber(number)) {
+        Toast.makeText(context, "This caller did not provide a usable phone number.", Toast.LENGTH_SHORT).show()
+        return false
+    }
     if (!BlockedNumberContract.canCurrentUserBlockNumbers(context)) {
         Toast.makeText(
             context,
             "CallerLens must be the default Phone app before it can block numbers.",
             Toast.LENGTH_LONG
         ).show()
-        return
+        return false
     }
 
-    try {
-        val values = ContentValues().apply {
-            put(BlockedNumberContract.BlockedNumbers.COLUMN_ORIGINAL_NUMBER, number)
+    return try {
+        if (!BlockedNumberContract.isBlocked(context, number)) {
+            val values = ContentValues().apply {
+                put(BlockedNumberContract.BlockedNumbers.COLUMN_ORIGINAL_NUMBER, number)
+            }
+            context.contentResolver.insert(BlockedNumberContract.BlockedNumbers.CONTENT_URI, values)
         }
-        context.contentResolver.insert(BlockedNumberContract.BlockedNumbers.CONTENT_URI, values)
         Toast.makeText(context, "Number blocked.", Toast.LENGTH_SHORT).show()
+        true
     } catch (_: SecurityException) {
         Toast.makeText(context, "Android did not allow CallerLens to block this number.", Toast.LENGTH_LONG).show()
+        false
+    } catch (_: Exception) {
+        Toast.makeText(context, "CallerLens could not block this number.", Toast.LENGTH_LONG).show()
+        false
     }
 }
 
@@ -1067,7 +1358,5 @@ private fun isCallerHidden(context: Context, caller: RecentCaller): Boolean {
     return hiddenThrough >= caller.lastCallMillis
 }
 
-private fun recentCallerKey(number: String): String {
-    val normalized = PhoneNumberUtils.normalizeNumber(number)
-    return if (normalized.length > 10) normalized.takeLast(10) else normalized
-}
+private fun recentCallerKey(number: String): String =
+    normalizedPhoneKey(number) ?: number.trim().lowercase()

@@ -55,8 +55,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.pgdevhouse.callerlens.data.CallLogRepository
 import com.pgdevhouse.callerlens.data.NumberStats
+import com.pgdevhouse.callerlens.data.fallbackCallerName
 import com.pgdevhouse.callerlens.data.formatLastCall
-import com.pgdevhouse.callerlens.data.formatPhoneNumber
+import com.pgdevhouse.callerlens.data.formatPresentedPhoneNumber
+import com.pgdevhouse.callerlens.data.isUsablePhoneNumber
 import com.pgdevhouse.callerlens.telecom.CallSession
 import com.pgdevhouse.callerlens.telecom.CallUiState
 import com.pgdevhouse.callerlens.ui.theme.CallerLensTheme
@@ -109,21 +111,24 @@ class CallActivity : ComponentActivity() {
 
     @Composable
     private fun CallScreen(state: CallUiState) {
-        var stats by remember(state.number) { mutableStateOf(NumberStats(days = 7)) }
-        var statsLoaded by remember(state.number) { mutableStateOf(false) }
+        var stats by remember(state.number, state.numberPresentation) { mutableStateOf(NumberStats(days = 7)) }
+        var statsLoaded by remember(state.number, state.numberPresentation) { mutableStateOf(false) }
         var keepScreenOn by remember {
             mutableStateOf(
                 getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
                     .getBoolean(KEEP_SCREEN_ON_KEY, false)
             )
         }
+        val hasUsableNumber = isUsablePhoneNumber(state.number, state.numberPresentation)
 
-        LaunchedEffect(state.number) {
+        LaunchedEffect(state.number, state.numberPresentation) {
             statsLoaded = false
-            if (state.number.isNotBlank()) {
-                stats = runCatching {
+            stats = if (hasUsableNumber) {
+                runCatching {
                     CallLogRepository(this@CallActivity).statsFor(state.number, 7)
                 }.getOrDefault(NumberStats(days = 7))
+            } else {
+                NumberStats(days = 7)
             }
             statsLoaded = true
         }
@@ -148,7 +153,7 @@ class CallActivity : ComponentActivity() {
 
                     when (state.state) {
                         Call.STATE_RINGING, Call.STATE_SIMULATED_RINGING -> {
-                            IncomingFrequencyHero(stats, statsLoaded)
+                            IncomingFrequencyHero(stats, statsLoaded, hasUsableNumber)
                             Spacer(Modifier.height(12.dp))
                             KeepScreenOnToggle(
                                 checked = keepScreenOn,
@@ -158,7 +163,7 @@ class CallActivity : ComponentActivity() {
                                 }
                             )
                             Spacer(Modifier.height(14.dp))
-                            IncomingCallContent()
+                            IncomingCallContent(hasUsableNumber)
                         }
                         Call.STATE_ACTIVE, Call.STATE_HOLDING -> {
                             KeepScreenOnToggle(
@@ -169,7 +174,7 @@ class CallActivity : ComponentActivity() {
                                 }
                             )
                             Spacer(Modifier.height(16.dp))
-                            ActiveCallContent(state, stats)
+                            ActiveCallContent(state, stats.takeIf { hasUsableNumber })
                         }
                         Call.STATE_DIALING, Call.STATE_CONNECTING -> {
                             KeepScreenOnToggle(
@@ -239,6 +244,9 @@ class CallActivity : ComponentActivity() {
 
     @Composable
     private fun CallerIdentity(state: CallUiState) {
+        val callerLabel = state.displayName?.takeIf { it.isNotBlank() }
+            ?: fallbackCallerName(state.numberPresentation)
+        val presentedNumber = formatPresentedPhoneNumber(state.number, state.numberPresentation)
         val initial = state.displayName
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
@@ -271,7 +279,7 @@ class CallActivity : ComponentActivity() {
 
             Spacer(Modifier.height(14.dp))
             Text(
-                text = state.displayName ?: "Unknown Caller",
+                text = callerLabel,
                 color = MaterialTheme.colorScheme.onBackground,
                 style = MaterialTheme.typography.headlineMedium,
                 textAlign = TextAlign.Center,
@@ -280,7 +288,7 @@ class CallActivity : ComponentActivity() {
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                text = formatPhoneNumber(state.number),
+                text = presentedNumber,
                 color = MaterialTheme.colorScheme.primary,
                 fontSize = 19.sp,
                 fontWeight = FontWeight.SemiBold,
@@ -357,7 +365,11 @@ class CallActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun IncomingFrequencyHero(stats: NumberStats, loaded: Boolean) {
+    private fun IncomingFrequencyHero(
+        stats: NumberStats,
+        loaded: Boolean,
+        historyAvailable: Boolean
+    ) {
         Surface(
             modifier = Modifier.fillMaxWidth(),
             color = MaterialTheme.colorScheme.primary,
@@ -375,7 +387,19 @@ class CallActivity : ComponentActivity() {
                 )
                 Spacer(Modifier.height(8.dp))
 
-                if (!loaded) {
+                if (!historyAvailable) {
+                    Text(
+                        text = "Recent call history unavailable",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.tertiary
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = "Android did not provide CallerLens with a usable phone number for this call.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.82f)
+                    )
+                } else if (!loaded) {
                     Text(
                         text = "Checking recent call history…",
                         style = MaterialTheme.typography.titleLarge,
@@ -422,8 +446,14 @@ class CallActivity : ComponentActivity() {
                         color = MaterialTheme.colorScheme.tertiary
                     )
                     Spacer(Modifier.height(4.dp))
+                    val breakdown = buildList {
+                        add("${stats.missed} missed")
+                        add("${stats.rejected} rejected")
+                        add("${stats.answered} answered")
+                        if (stats.blocked > 0) add("${stats.blocked} blocked")
+                    }.joinToString(" • ")
                     Text(
-                        text = "${stats.missed} missed • ${stats.rejected} rejected • ${stats.answered} answered",
+                        text = breakdown,
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.86f)
                     )
@@ -433,7 +463,7 @@ class CallActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun ColumnScope.IncomingCallContent() {
+    private fun ColumnScope.IncomingCallContent(canManageNumber: Boolean) {
         Spacer(Modifier.weight(1f))
 
         Button(
@@ -458,23 +488,25 @@ class CallActivity : ComponentActivity() {
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(9.dp)
         ) {
-            CallActionButton(
-                modifier = Modifier.weight(1f),
-                icon = Icons.Default.Block,
-                label = "Block",
-                containerColor = MaterialTheme.colorScheme.secondary,
-                contentColor = MaterialTheme.colorScheme.onSecondary,
-                onClick = {
-                    val blocked = CallSession.blockNumber(this@CallActivity)
-                    if (!blocked) {
-                        Toast.makeText(
-                            this@CallActivity,
-                            "CallerLens could not add this number to Android's blocked list.",
-                            Toast.LENGTH_LONG
-                        ).show()
+            if (canManageNumber) {
+                CallActionButton(
+                    modifier = Modifier.weight(1f),
+                    icon = Icons.Default.Block,
+                    label = "Block",
+                    containerColor = MaterialTheme.colorScheme.secondary,
+                    contentColor = MaterialTheme.colorScheme.onSecondary,
+                    onClick = {
+                        val blocked = CallSession.blockNumber(this@CallActivity)
+                        if (!blocked) {
+                            Toast.makeText(
+                                this@CallActivity,
+                                "CallerLens could not add this number to Android's blocked list.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
                     }
-                }
-            )
+                )
+            }
             CallActionButton(
                 modifier = Modifier.weight(1f),
                 icon = Icons.Default.PhoneForwarded,
@@ -495,8 +527,12 @@ class CallActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun ColumnScope.ActiveCallContent(state: CallUiState, stats: NumberStats) {
-        CallHistoryCard(stats, compact = true)
+    private fun ColumnScope.ActiveCallContent(state: CallUiState, stats: NumberStats?) {
+        if (stats != null) {
+            CallHistoryCard(stats, compact = true)
+        } else {
+            HistoryUnavailableCard()
+        }
         Spacer(Modifier.weight(1f))
 
         Text(
@@ -660,6 +696,33 @@ class CallActivity : ComponentActivity() {
                         StatTile(Modifier.weight(1f), stats.answered, "Answered")
                     }
                 }
+            }
+        }
+    }
+
+
+    @Composable
+    private fun HistoryUnavailableCard() {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface,
+            shape = RoundedCornerShape(24.dp),
+            shadowElevation = 4.dp
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 18.dp, vertical = 14.dp)) {
+                Text(
+                    text = "CALL HISTORY",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = MaterialTheme.colorScheme.background,
+                    letterSpacing = 1.1.sp
+                )
+                Spacer(Modifier.height(5.dp))
+                Text(
+                    text = "Recent history unavailable for this caller",
+                    style = MaterialTheme.typography.titleMedium
+                )
             }
         }
     }

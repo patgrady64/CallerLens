@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.provider.CallLog
-import android.telephony.PhoneNumberUtils
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -32,7 +31,8 @@ data class RecentCaller(
 class CallLogRepository(private val context: Context) {
 
     suspend fun statsFor(number: String, days: Int = 7): NumberStats = withContext(Dispatchers.IO) {
-        if (!hasCallLogPermission() || number.isBlank()) return@withContext NumberStats(days = days)
+        if (!hasCallLogPermission()) return@withContext NumberStats(days = days)
+        val targetKey = normalizedPhoneKey(number) ?: return@withContext NumberStats(days = days)
 
         val cutoff = System.currentTimeMillis() - days * DAY_MS
         var total = 0
@@ -59,7 +59,7 @@ class CallLogRepository(private val context: Context) {
 
             while (cursor.moveToNext()) {
                 val rowNumber = cursor.getString(numberIndex) ?: continue
-                if (!sameNumber(rowNumber, number)) continue
+                if (normalizedPhoneKey(rowNumber) != targetKey) continue
 
                 when (cursor.getInt(typeIndex)) {
                     CallLog.Calls.INCOMING_TYPE -> {
@@ -75,6 +75,7 @@ class CallLogRepository(private val context: Context) {
                         rejected++
                     }
                     CallLog.Calls.BLOCKED_TYPE -> {
+                        total++
                         blocked++
                     }
                     else -> continue
@@ -123,7 +124,7 @@ class CallLogRepository(private val context: Context) {
                 ) continue
 
                 val number = cursor.getString(numberIndex) ?: continue
-                val key = normalizedKey(number)
+                val key = normalizedPhoneKey(number) ?: continue
                 val date = cursor.getLong(dateIndex)
                 val existing = grouped[key]
                 if (existing == null) {
@@ -148,14 +149,6 @@ class CallLogRepository(private val context: Context) {
 
     private fun hasCallLogPermission(): Boolean =
         ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED
-
-    @Suppress("DEPRECATION")
-    private fun sameNumber(a: String, b: String): Boolean = PhoneNumberUtils.compare(a, b)
-
-    private fun normalizedKey(number: String): String {
-        val normalized = PhoneNumberUtils.normalizeNumber(number)
-        return if (normalized.length > 10) normalized.takeLast(10) else normalized
-    }
 
     private data class MutableRecentCaller(
         val number: String,
