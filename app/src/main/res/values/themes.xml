@@ -1,0 +1,15 @@
+<resources>
+    <style name="Theme.CallerLens" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:navigationBarColor">#FFFFFF</item>
+        <item name="android:statusBarColor">#FFFFFF</item>
+    </style>
+
+    <style name="Theme.CallerLens.Call" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:navigationBarColor">#101418</item>
+        <item name="android:statusBarColor">#101418</item>
+    </style>
+</resources>
